@@ -1,0 +1,4 @@
+Timestamp,Event,Confidence,Action_Required
+2026-02-12 12:00:01,Pothole,0.85,Maintenance Alert
+2026-02-12 12:00:05,Speed Breaker,0.92,Maintenance Alert
+2026-02-12 12:00:10,Cracks,0.78,Maintenance Alert
