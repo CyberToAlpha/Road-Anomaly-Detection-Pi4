@@ -3,28 +3,32 @@ import time
 import datetime
 import os
 import numpy as np
+import csv
 from flask import Flask, Response
 import tensorflow.lite as tflite
 
 # --- CONFIGURATION ---
 CAMERA_INDEX = 0
 MODEL_PATH = "best_320_int8.tflite"
-CONFIDENCE_THRESHOLD = 0.45
+# Set to 0.20 so it easily detects potholes on a laptop screen for your demo!
+CONFIDENCE_THRESHOLD = 0.40 
 NMS_THRESHOLD = 0.50
-
-# --- PERFORMANCE TUNING ---
-# 1 = Show every frame (Slowest, ~5 FPS)
-# 2 = Show every 2nd frame (Faster)
-# 3 = Show every 3rd frame (Best for Performance, ~12 FPS inference)
 FRAME_SKIP = 3 
 
-# --- SETUP RECORDING ---
+# --- SETUP RECORDING & CSV LOGGING ---
 if not os.path.exists('logs'):
     os.makedirs('logs')
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 video_filename = f"logs/mission_{timestamp}.avi"
+csv_filename = f"logs/data_{timestamp}.csv"
+
 fourcc = cv2.VideoWriter_fourcc(*'MJPG')
 out = cv2.VideoWriter(video_filename, fourcc, 10.0, (640, 480))
+
+# Initialize CSV for Dashboard Demo
+csv_file = open(csv_filename, mode='w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(["Timestamp", "Latitude", "Longitude", "Event", "Confidence", "Action_Required"])
 
 app = Flask(__name__)
 
@@ -34,27 +38,40 @@ interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# Quantization Params
-output_scale = output_details[0]['quantization'][0]
-output_zero_point = output_details[0]['quantization'][1]
-
 def detect_objects(frame):
     original_h, original_w = frame.shape[:2]
 
-    # Preprocess
+    # --- THE INT8 DYNAMIC FIX ---
     input_shape = input_details[0]['shape']
     model_w, model_h = input_shape[1], input_shape[2]
     resized = cv2.resize(frame, (model_w, model_h))
-    input_data = (np.float32(resized) - 128).astype(np.int8)
-    input_data = np.expand_dims(input_data, axis=0)
+    input_data = np.expand_dims(resized, axis=0)
     
+    expected_dtype = input_details[0]['dtype']
+
+    if expected_dtype == np.float32:
+        input_data = input_data.astype(np.float32) / 255.0
+    elif expected_dtype == np.int8:
+        scale, zero_point = input_details[0]['quantization']
+        input_data = (input_data.astype(np.float32) / 255.0)
+        if scale > 0:
+            input_data = ((input_data / scale) + zero_point)
+        input_data = np.clip(input_data, -128, 127).astype(np.int8)
+    elif expected_dtype == np.uint8:
+        input_data = input_data.astype(np.uint8)
+
     # Inference
     interpreter.set_tensor(input_details[0]['index'], input_data)
     interpreter.invoke()
 
     # Post-Process (YOLO)
     output_data = interpreter.get_tensor(output_details[0]['index'])[0] 
-    output_data = (output_data.astype(np.float32) - output_zero_point) * output_scale
+    
+    # De-quantize output if it is int8
+    if output_details[0]['dtype'] == np.int8:
+        out_scale, out_zero_point = output_details[0]['quantization']
+        output_data = (output_data.astype(np.float32) - out_zero_point) * out_scale
+        
     output_data = output_data.transpose()
 
     boxes = []
@@ -80,17 +97,29 @@ def detect_objects(frame):
     indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
 
     if len(indices) > 0:
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
         for i in indices.flatten():
             box = boxes[i]
             x, y, w, h = box[0], box[1], box[2], box[3]
-            label = f"Class {class_ids[i]}: {int(confidences[i]*100)}%"
+            
+            # Map labels for CSV
+            labels_map = ["Pothole", "Speed Breaker", "Manhole", "Crack"]
+            label_text = labels_map[class_ids[i]] if class_ids[i] < len(labels_map) else f"Class {class_ids[i]}"
+            confidence = confidences[i]
+            
+            # Draw on Web Stream
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(frame, f"{label_text}: {int(confidence*100)}%", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Log to CSV instantly with dummy GPS coordinates for the demo
+            csv_writer.writerow([current_time, "12.9716", "77.5946", label_text, f"{confidence:.2f}", "Maintenance Alert"])
+            csv_file.flush() # Force save immediately!
 
     return frame
 
 def generate_frames():
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+    # V4L2 backend works best on Pi
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -103,22 +132,15 @@ def generate_frames():
             break
         
         try:
-            # 1. ALWAYS Detect (This keeps the Real FPS high)
             frame = detect_objects(frame)
             
-            # 2. Update FPS Counter
             curr_time = time.time()
             fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
             prev_time = curr_time
             
-            # Draw FPS on the frame
-            cv2.putText(frame, f"TRUE FPS: {fps:.1f}", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-            # 3. ALWAYS Record (Evidence must be complete)
+            cv2.putText(frame, f"TRUE FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             out.write(frame)
 
-            # 4. CONDITIONAL Stream (The Performance Trick)
             frame_counter += 1
             if frame_counter % FRAME_SKIP == 0:
                 ret, buffer = cv2.imencode('.jpg', frame)
@@ -139,8 +161,7 @@ def video_feed():
 
 if __name__ == '__main__':
     try:
-        # Threaded=True allows Flask to handle requests without blocking the loop too much
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     finally:
         out.release()
-        print(f"Video saved to {video_filename}")
+        csv_file.close()
